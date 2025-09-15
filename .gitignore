@@ -7,6 +7,7 @@ venv/
 # Ignore project-specific data
 inbox/
 data/
+logs/
 
 # Ignore OS files
 .DS_Store
