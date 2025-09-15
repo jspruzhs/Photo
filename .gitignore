@@ -1,15 +1,21 @@
-# Ignore Python cache and virtual environments
+# Python cache / venv
 __pycache__/
 *.pyc
 .venv/
 venv/
 
-# Ignore project-specific data
-inbox/
-data/
-logs/
+# Project data folders (ignore everything inside)
+inbox/*
+data/*
+logs/*
 
-# Ignore OS files
+# But keep placeholder files so folders show up in repo
+!inbox/.gitkeep
+!data/.gitkeep
+!logs/.gitkeep
+
+# OS junk
 .DS_Store
 Thumbs.db
+
 
