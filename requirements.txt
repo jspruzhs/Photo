@@ -1,6 +1,7 @@
 # Core dependencies for local photo tracker
 openpyxl>=3.1,<4
 pillow>=10,<11
+openai>=1.40.0
 
 # Optional (enable later for duplicate detection)
 # imagehash>=4.3,<5

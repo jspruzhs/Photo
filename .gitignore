@@ -8,11 +8,13 @@ venv/
 inbox/*
 data/*
 logs/*
+previews/*
 
 # But keep placeholder files so folders show up in repo
 !inbox/.gitkeep
 !data/.gitkeep
 !logs/.gitkeep
+!previews/.gitkeep
 
 # OS junk
 .DS_Store

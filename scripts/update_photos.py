@@ -1,12 +1,16 @@
 import os
+import io
+import json
+import base64
 import hashlib
 import logging
 import signal
 import atexit
+import time
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from datetime import datetime, timedelta
-from typing import List, Dict, Tuple
+from typing import List, Dict, Tuple, Optional
 
 from PIL import Image
 from openpyxl import load_workbook
@@ -23,6 +27,11 @@ LOCK_FILE = Path(".update.lock")  # PID lock file in repo root
 LOCK_STALE_AFTER = timedelta(hours=2)
 
 SUPPORTED_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".tiff", ".heic", ".heif"}
+
+# GPT config
+GPT_MODEL = "gpt-4o-mini"  # good quality + cost
+MAX_TAGS = 35               # Shutterstock allows up to 50; we keep it lean
+PER_IMAGE_SLEEP = 0.3       # soft pacing to avoid rate limits
 
 # ---------- Logging Setup ----------
 def setup_logging() -> logging.Logger:
@@ -64,7 +73,6 @@ def acquire_lock():
     """
     global _lock_acquired
 
-    # If lock exists, check staleness
     if LOCK_FILE.exists():
         try:
             mtime = datetime.fromtimestamp(LOCK_FILE.stat().st_mtime)
@@ -73,7 +81,6 @@ def acquire_lock():
                 log.warning(f"Existing lock is stale (age {age}). Overriding.")
                 LOCK_FILE.unlink(missing_ok=True)
             else:
-                # read pid for info
                 try:
                     pid_txt = LOCK_FILE.read_text().strip()
                 except Exception:
@@ -81,10 +88,8 @@ def acquire_lock():
                 log.error(f"Another run appears active (lock {LOCK_FILE}, pid {pid_txt}, age {age}). Exiting.")
                 raise SystemExit(1)
         except FileNotFoundError:
-            # Race: lock was removed between exists() and stat()
             pass
 
-    # Attempt atomic create
     try:
         fd = os.open(str(LOCK_FILE), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
         with os.fdopen(fd, "w") as f:
@@ -92,23 +97,20 @@ def acquire_lock():
         _lock_acquired = True
         log.info(f"Lock acquired (pid {os.getpid()})")
     except FileExistsError:
-        # Another process beat us between exists() and open
         log.error("Lock already exists, exiting.")
         raise SystemExit(1)
 
-    # Ensure cleanup on exit & signals
     atexit.register(_remove_lock)
 
     def _signal_handler(signum, frame):
         log.info(f"Received signal {signum}, cleaning up...")
         _remove_lock()
-        raise SystemExit(130)  # standard for SIGINT
+        raise SystemExit(130)
 
     for sig in (signal.SIGINT, signal.SIGTERM):
         try:
             signal.signal(sig, _signal_handler)
         except Exception:
-            # Some environments may not support setting handlers
             pass
 
 # ---------- Helpers ----------
@@ -165,38 +167,6 @@ def load_existing_rows(ws) -> Dict[str, Tuple[int, Dict]]:
             existing[key] = (i, row_dict)
     return existing
 
-def update_excel(file_metadata_list: List[Dict]) -> Tuple[int, int]:
-    """Update Excel with new/changed metadata. Returns (added_count, updated_count)."""
-    if not EXCEL_PATH.exists():
-        raise FileNotFoundError(f"{EXCEL_PATH} not found")
-
-    wb = load_workbook(EXCEL_PATH)
-    if SHEET_NAME not in wb.sheetnames:
-        raise RuntimeError(f"Sheet '{SHEET_NAME}' not found in {EXCEL_PATH}")
-    ws = wb[SHEET_NAME]
-
-    headers = [cell.value for cell in ws[1]]
-    existing = load_existing_rows(ws)
-
-    added = updated = 0
-
-    for meta in file_metadata_list:
-        key = meta["abs_path"]
-        if key in existing:
-            rownum, old_row = existing[key]
-            # Update only metadata + last_seen; preserve manual fields
-            for col, header in enumerate(headers, start=1):
-                if header in ("description", "tags", "status", "notes"):
-                    continue
-                ws.cell(row=rownum, column=col, value=meta.get(header, ""))
-            updated += 1
-        else:
-            ws.append([meta.get(h, "") for h in headers])
-            added += 1
-
-    wb.save(EXCEL_PATH)
-    return added, updated
-
 def scan_inbox() -> List[Dict]:
     """Scan inbox/ for supported image files."""
     if not INBOX.exists():
@@ -226,10 +196,180 @@ def reset_excel():
     wb.save(EXCEL_PATH)
     log.info(f"Reset {EXCEL_PATH} (headers only kept)")
 
+def open_workbook():
+    if not EXCEL_PATH.exists():
+        raise FileNotFoundError(f"{EXCEL_PATH} not found")
+    wb = load_workbook(EXCEL_PATH)
+    if SHEET_NAME not in wb.sheetnames:
+        raise RuntimeError(f"Sheet '{SHEET_NAME}' not found in {EXCEL_PATH}")
+    ws = wb[SHEET_NAME]
+    headers = [cell.value for cell in ws[1]]
+    return wb, ws, headers
+
+def update_excel(file_metadata_list: List[Dict]) -> Tuple[int, int]:
+    """Update Excel with new/changed metadata. Returns (added_count, updated_count)."""
+    wb, ws, headers = open_workbook()
+    existing = load_existing_rows(ws)
+
+    added = updated = 0
+    for meta in file_metadata_list:
+        key = meta["abs_path"]
+        if key in existing:
+            rownum, old_row = existing[key]
+            for col, header in enumerate(headers, start=1):
+                if header in ("description", "tags", "status", "notes"):
+                    continue
+                ws.cell(row=rownum, column=col, value=meta.get(header, ""))
+            updated += 1
+        else:
+            ws.append([meta.get(h, "") for h in headers])
+            added += 1
+
+    wb.save(EXCEL_PATH)
+    return added, updated
+
+# ---------- GPT Integration ----------
+def load_api_key() -> Optional[str]:
+    # 1) config.json
+    cfg = Path("config.json")
+    if cfg.exists():
+        try:
+            with open(cfg) as f:
+                data = json.load(f)
+                if data.get("OPENAI_API_KEY"):
+                    return data["OPENAI_API_KEY"]
+        except Exception as e:
+            log.warning(f"Failed to read config.json: {e}")
+    # 2) env var
+    return os.getenv("OPENAI_API_KEY")
+
+def make_preview_b64(path: Path, max_side: int = 1024, jpeg_quality: int = 80) -> str:
+    """Create a resized JPEG preview and return data URL (base64)."""
+    with Image.open(path) as img:
+        img = img.convert("RGB")
+        img.thumbnail((max_side, max_side))
+        buf = io.BytesIO()
+        img.save(buf, format="JPEG", quality=jpeg_quality, optimize=True)
+        b64 = base64.b64encode(buf.getvalue()).decode("ascii")
+        return f"data:image/jpeg;base64,{b64}"
+
+def prompt_for_shutterstock():
+    system = (
+        "You are a metadata generator for Shutterstock. "
+        "Write a concise, factual, search-friendly photo description (<= 180 chars). "
+        "Avoid opinions, branding, private info, and spam. "
+        f"Return strict JSON with keys: description (string), tags (array, max {MAX_TAGS}, singular nouns, ordered by relevance)."
+    )
+    user = (
+        "Look at the image and produce JSON. "
+        "Description should mention main subject and context (e.g., location or action if clear). "
+        f"Tags: 15–{MAX_TAGS} keywords, no duplicates, no brand names, no people names unless obviously public figures."
+    )
+    return system, user
+
+def call_gpt_for_image(api_key: str, img_path: Path) -> Optional[Dict]:
+    try:
+        from openai import OpenAI
+    except Exception as e:
+        log.error(f"OpenAI SDK not installed: {e}")
+        return None
+
+    client = OpenAI(api_key=api_key)
+    data_url = make_preview_b64(img_path)
+    system, user = prompt_for_shutterstock()
+
+    try:
+        # Using Chat Completions with image + strict JSON ask
+        resp = client.chat.completions.create(
+            model=GPT_MODEL,
+            temperature=0.2,
+            messages=[
+                {"role": "system", "content": system},
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": user},
+                        {"type": "image_url", "image_url": {"url": data_url}},
+                    ],
+                },
+            ],
+            response_format={"type": "json_object"},
+        )
+        text = resp.choices[0].message.content.strip()
+        data = json.loads(text)
+        # Basic normalization
+        desc = (data.get("description") or "").strip()
+        tags = [t.strip() for t in (data.get("tags") or []) if isinstance(t, str) and t.strip()]
+        tags = list(dict.fromkeys(tags))[:MAX_TAGS]  # de-dupe + cap
+        return {"description": desc, "tags": tags}
+    except Exception as e:
+        log.error(f"GPT call failed for {img_path.name}: {e}")
+        return None
+
+def describe_needed_rows(limit: Optional[int] = None) -> int:
+    """
+    For rows where description/tags are empty AND status in {NEW, ANALYZED},
+    call GPT and write back. Returns count updated.
+    """
+    api_key = load_api_key()
+    if not api_key:
+        log.error("Missing OPENAI_API_KEY (config.json or env). Cannot describe.")
+        return 0
+
+    wb, ws, headers = open_workbook()
+    col_index = {h: i+1 for i, h in enumerate(headers)}
+
+    updated = 0
+    start_row = 2
+    end_row = ws.max_row
+    for r in range(start_row, end_row + 1):
+        status = ws.cell(row=r, column=col_index["status"]).value or ""
+        desc = (ws.cell(row=r, column=col_index["description"]).value or "").strip()
+        tags_cell = (ws.cell(row=r, column=col_index["tags"]).value or "").strip()
+        abs_path = ws.cell(row=r, column=col_index["abs_path"]).value or ""
+        file_name = ws.cell(row=r, column=col_index["file_name"]).value or ""
+
+        if status not in ("NEW", "ANALYZED"):
+            continue
+        if desc and tags_cell:
+            continue
+        if not abs_path:
+            continue
+
+        img_path = Path(abs_path)
+        if not img_path.exists():
+            log.warning(f"File missing on disk for description: {abs_path}")
+            continue
+
+        log.info(f"Describing: {file_name}")
+        result = call_gpt_for_image(api_key, img_path)
+        if not result:
+            continue
+
+        # Write results
+        ws.cell(row=r, column=col_index["description"], value=result["description"])
+        ws.cell(row=r, column=col_index["tags"], value=", ".join(result["tags"]))
+        ws.cell(row=r, column=col_index["status"], value="DESCRIBED")
+        ws.cell(row=r, column=col_index["last_seen"], value=datetime.utcnow().isoformat())
+        updated += 1
+
+        # Soft pacing to reduce rate-limit risk
+        time.sleep(PER_IMAGE_SLEEP)
+
+        if limit and updated >= limit:
+            break
+
+    if updated:
+        wb.save(EXCEL_PATH)
+    log.info(f"Describe step updated {updated} row(s)")
+    return updated
+
 # ---------- CLI ----------
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Scan inbox/ and sync data/photos.xlsx")
     parser.add_argument("--reset", action="store_true", help="Reset Excel (keep headers only)")
+    parser.add_argument("--describe", action="store_true", help="Generate description & tags with GPT for rows needing it")
+    parser.add_argument("--describe-limit", type=int, default=None, help="Max rows to process in a single describe run")
     args = parser.parse_args()
 
     # Locking first
@@ -249,3 +389,11 @@ if __name__ == "__main__":
         except Exception as e:
             log.exception(f"Excel update failed: {e}")
             print("❌ Excel update failed (see logs/update.log)")
+
+        if args.describe:
+            try:
+                n = describe_needed_rows(limit=args.describe_limit)
+                print(f"📝 Describe step updated {n} row(s)")
+            except Exception as e:
+                log.exception(f"Describe step failed: {e}")
+                print("❌ Describe step failed (see logs/update.log)")
