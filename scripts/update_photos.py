@@ -1,9 +1,11 @@
 import os
 import hashlib
 import logging
+import signal
+import atexit
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import List, Dict, Tuple
 
 from PIL import Image
@@ -17,6 +19,8 @@ EXCEL_PATH = Path("data/photos.xlsx")
 SHEET_NAME = "Photos"
 LOG_DIR = Path("logs")
 LOG_FILE = LOG_DIR / "update.log"
+LOCK_FILE = Path(".update.lock")  # PID lock file in repo root
+LOCK_STALE_AFTER = timedelta(hours=2)
 
 SUPPORTED_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".tiff", ".heic", ".heif"}
 
@@ -26,14 +30,12 @@ def setup_logging() -> logging.Logger:
     logger = logging.getLogger("photo_manager")
     logger.setLevel(logging.INFO)
 
-    # Avoid double handlers if script is reloaded
     if not logger.handlers:
         handler = RotatingFileHandler(LOG_FILE, maxBytes=1_000_000, backupCount=3, encoding="utf-8")
         formatter = logging.Formatter("%(asctime)s | %(levelname)s | %(message)s")
         handler.setFormatter(formatter)
         logger.addHandler(handler)
 
-        # Also echo to console
         console = logging.StreamHandler()
         console.setFormatter(formatter)
         logger.addHandler(console)
@@ -41,6 +43,73 @@ def setup_logging() -> logging.Logger:
     return logger
 
 log = setup_logging()
+
+# ---------- Locking ----------
+_lock_acquired = False
+
+def _remove_lock():
+    """Remove lock file on exit if we created it."""
+    global _lock_acquired
+    try:
+        if _lock_acquired and LOCK_FILE.exists():
+            LOCK_FILE.unlink()
+            log.info("Lock released")
+    except Exception as e:
+        log.warning(f"Failed to remove lock file: {e}")
+
+def acquire_lock():
+    """
+    Acquire an exclusive run lock using an atomic PID file.
+    If a fresh lock exists, exit. If stale, replace it.
+    """
+    global _lock_acquired
+
+    # If lock exists, check staleness
+    if LOCK_FILE.exists():
+        try:
+            mtime = datetime.fromtimestamp(LOCK_FILE.stat().st_mtime)
+            age = datetime.now() - mtime
+            if age > LOCK_STALE_AFTER:
+                log.warning(f"Existing lock is stale (age {age}). Overriding.")
+                LOCK_FILE.unlink(missing_ok=True)
+            else:
+                # read pid for info
+                try:
+                    pid_txt = LOCK_FILE.read_text().strip()
+                except Exception:
+                    pid_txt = "unknown"
+                log.error(f"Another run appears active (lock {LOCK_FILE}, pid {pid_txt}, age {age}). Exiting.")
+                raise SystemExit(1)
+        except FileNotFoundError:
+            # Race: lock was removed between exists() and stat()
+            pass
+
+    # Attempt atomic create
+    try:
+        fd = os.open(str(LOCK_FILE), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        with os.fdopen(fd, "w") as f:
+            f.write(str(os.getpid()))
+        _lock_acquired = True
+        log.info(f"Lock acquired (pid {os.getpid()})")
+    except FileExistsError:
+        # Another process beat us between exists() and open
+        log.error("Lock already exists, exiting.")
+        raise SystemExit(1)
+
+    # Ensure cleanup on exit & signals
+    atexit.register(_remove_lock)
+
+    def _signal_handler(signum, frame):
+        log.info(f"Received signal {signum}, cleaning up...")
+        _remove_lock()
+        raise SystemExit(130)  # standard for SIGINT
+
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        try:
+            signal.signal(sig, _signal_handler)
+        except Exception:
+            # Some environments may not support setting handlers
+            pass
 
 # ---------- Helpers ----------
 def sha256sum(file_path: Path) -> str:
@@ -162,6 +231,9 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Scan inbox/ and sync data/photos.xlsx")
     parser.add_argument("--reset", action="store_true", help="Reset Excel (keep headers only)")
     args = parser.parse_args()
+
+    # Locking first
+    acquire_lock()
 
     if args.reset:
         log.info("Starting reset...")
