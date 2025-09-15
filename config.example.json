@@ -1,3 +1,7 @@
 {
-  "OPENAI_API_KEY": "your-key-here"
+  "OPENAI_API_KEY": "your-key-here",
+  "SHUTTERSTOCK": {
+    "USERNAME": "your-ss-username",
+    "PASSWORD": "your-ss-password"
+  }
 }

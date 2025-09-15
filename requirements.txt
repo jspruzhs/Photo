@@ -3,5 +3,13 @@ openpyxl>=3.1,<4
 pillow>=10,<11
 openai>=1.40.0
 
+# CLI + Shutterstock uploader
+playwright>=1.46,<2
+rich>=13,<14
+python-dateutil>=2.9,<3
+pytz>=2024.1,<2025
+keyring>=24,<25
+
+
 # Optional (enable later for duplicate detection)
 # imagehash>=4.3,<5
