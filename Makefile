@@ -68,3 +68,18 @@ help:  ## Show this help
 	@printf "  make adapt-ss\n"
 	@printf "  make adapt-ss FORCE=1 LIMIT=50\n"
 	@printf "  make reset\n\n"
+
+# -------- Shutterstock CLI --------
+.PHONY: ss-login ss-quota ss-upload ss-status
+
+ss-login: install  ## Login to Shutterstock Contributor
+	$(PY) scripts/ss_cli.py ss:login
+
+ss-quota: install  ## Show Shutterstock quota usage
+	$(PY) scripts/ss_cli.py ss:quota
+
+ss-upload: install  ## Upload images to Shutterstock (enforces quota)
+	$(PY) scripts/ss_cli.py ss:upload --limit 10
+
+ss-status: install  ## Show recent Shutterstock submissions
+	$(PY) scripts/ss_cli.py ss:status --limit 20 --days 30

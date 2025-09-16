@@ -19,13 +19,40 @@ Everything runs through a Python 3.11 virtualenv via `make` (no manual activatio
 ├─ logs/ # Rotating logs (gitignored)
 ├─ scripts/
 │ ├─ update_photos.py # Scan, previews, Excel sync, base_* with GPT
+│ ├─ ss_cli.py # upload photos and metadata to ShutterStock
 │ └─ adapt_shutterstock.py # base_* -> SS_* adapter (title/desc/tags)
 ├─ requirements.txt
 ├─ Makefile
 ├─ config.json # { "OPENAI_API_KEY": "sk-..." } (gitignored)
 └─ .gitignore
 
+## Shutterstock CLI (ss_cli.py)
 
+We also have a dedicated **CLI tool** for direct interaction with Shutterstock.
+
+### Commands
+
+```bash
+make ss-login     # Open browser and store session cookies
+make ss-quota     # Show rolling 7-day quota usage (500 limit)
+make ss-upload    # Upload from Excel plan, enforce quota, wait ingestion
+make ss-status    # List recent submissions
+
+Notes
+
+Credentials can come from config.json (SHUTTERSTOCK.USERNAME / PASSWORD), or env vars (SS_USER / SS_PASS).
+
+Upload enforces Shutterstock’s 500 uploads / 7 days rule.
+
+Data updates:
+
+Excel data/photos.xlsx: SS_status, SS_asset_id, timestamps
+
+Ledger: data/ss_quota_ledger.jsonl
+
+Run with --dry-run to preview without browser.
+
+Run with --headful to watch the UI while it uploads.
 
 **.gitignore** should include at least: `data/`, `inbox/`, `previews/`, `logs/`, `config.json`.
 
