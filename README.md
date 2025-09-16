@@ -239,3 +239,5 @@ python scripts/ss_cli.py ss:upload --limit 10 --headful
 or
 
 python scripts/ss_cli.py ss:upload --limit 10
+
+python scripts/ss_cli.py ss:csv-upload --headful --timeout 50

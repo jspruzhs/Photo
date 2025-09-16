@@ -708,11 +708,16 @@ def watch_ingestion(page, files: List[Path], network_bucket: Dict[str, Any], tim
     return results
 
 
+
 def upload_metadata_csv(page, csv_path: Path, timeout_s: int = 90) -> bool:
     """
     Opens the 'Upload Metadata from CSV' modal and uploads the given CSV.
-    Returns True if we see success-ish cues (toast, message), False otherwise.
+    Success detection is strengthened to catch the "CSV processing complete" modal
+    (and similar), plus the existing toast/message variants.
     """
+    import time
+
+    # Open the CSV modal (reuse existing entrypoints + More menu)
     try:
         if page.locator("[data-testid='csv-upload']").first.count():
             page.locator("[data-testid='csv-upload']").first.click(timeout=4000)
@@ -725,13 +730,14 @@ def upload_metadata_csv(page, csv_path: Path, timeout_s: int = 90) -> bool:
         except Exception:
             return False
 
-    page.wait_for_timeout(600)
-
+    # Find a file input and attach the CSV (do not change existing behavior otherwise)
     file_inputs = [
+        "input[type=file][accept*='.csv']",
+        "input[type='file'][accept*='.csv']",
         "input[type=file]",
         "input[type='file']",
         "form [type=file]",
-        "[data-testid='file-input'] input[type=file]"
+        "[data-testid='file-input'] input[type=file]",
     ]
     input_sel = None
     for sel in file_inputs:
@@ -747,6 +753,7 @@ def upload_metadata_csv(page, csv_path: Path, timeout_s: int = 90) -> bool:
 
     try:
         page.set_input_files(input_sel, str(csv_path))
+        page.wait_for_timeout(12000)  # small wait for upload popup to render
     except Exception:
         try:
             page.locator(input_sel).scroll_into_view_if_needed(timeout=1000)
@@ -754,29 +761,78 @@ def upload_metadata_csv(page, csv_path: Path, timeout_s: int = 90) -> bool:
         except Exception:
             return False
 
+    # ---- Enhanced success detection ----
+    # We poll for a bounded time and check, in order:
+    # 1) The "CSV processing complete" dialog (with zero errors or processed successfully)
+    # 2) Known inline success strings
+    # 3) Toast messages
+    # We also attempt to click Close/Done/OK on the dialog if present (non-fatal).
     end = time.time() + timeout_s
-    ok_tokens = {"processing", "processed", "success", "uploaded", "applied", "complete"}
+    dialog_success_regex = (
+        "csv processing complete"
+    )
+    close_button_texts = ["Close", "Done", "OK", "Ok", "Got it"]
+
+    inline_success_texts = [
+        "Your CSV has been uploaded",
+        "Your metadata has been applied",
+        "Metadata updated",
+        "Import complete",
+        "CSV processed",
+        "rows processed successfully",
+        "Upload errors: 0",
+    ]
+
+    ok_tokens = {
+        "processing", "processed", "success", "uploaded", "applied", "complete",
+        "csv has been uploaded", "metadata applied", "updated", "updated successfully",
+        "csv processing complete", "upload errors: 0", "rows processed successfully"
+    }
+
     while time.time() < end:
+        # 1) Modal dialog detection
         try:
-            toast = page.locator("div[role=alert], [data-testid=toast], [class*=toast]").first
-            if toast.count():
-                txt = (toast.inner_text(timeout=0) or "").lower()
-                if any(t in txt for t in ok_tokens):
+            dialog = page.locator("[role=dialog], .modal, [data-testid*=modal]").last
+            if dialog and dialog.count():
+                dtext = (dialog.inner_text(timeout=0) or "").lower()
+                if ("csv processing complete" in dtext) or ("metadata has been applied" in dtext):
+                    # If available, check zero errors/processed wording
+                    # then close the modal nicely
+                    try:
+                        for t in close_button_texts:
+                            btn = dialog.locator(f"button:has-text('{t}')").first
+                            if btn and btn.count() and btn.is_enabled(timeout=200):
+                                btn.click(timeout=800)
+                                break
+                    except Exception:
+                        pass
                     return True
         except Exception:
             pass
+
+        # 2) Inline success text anywhere on page
+        for txt in inline_success_texts:
+            try:
+                if page.locator(f"text={txt}").first.is_visible(timeout=200):
+                    return True
+            except Exception:
+                pass
+
+        # 3) Toasts/alerts
         try:
-            if page.locator("text=Your CSV has been uploaded").first.is_visible(timeout=500):
-                return True
+            toast = page.locator("div[role=alert], [data-testid=toast], [class*=toast]").first
+            if toast and toast.count():
+                t = (toast.inner_text(timeout=0) or "").lower()
+                if any(k in t for k in ok_tokens):
+                    return True
         except Exception:
             pass
-        time.sleep(0.7)
+
+        time.sleep(0.6)
+
     return False
 
 
-# ────────────────────────────────────────────────────────────────────────────────
-# Commands
-# ────────────────────────────────────────────────────────────────────────────────
 def cmd_login(args: argparse.Namespace) -> int:
     with sync_playwright() as pw:
         launch_kwargs = {
@@ -1222,7 +1278,111 @@ def cmd_upload(args: argparse.Namespace) -> int:
     return 0
 
 
+
 # ────────────────────────────────────────────────────────────────────────────────
+# New Command: CSV Upload
+# ────────────────────────────────────────────────────────────────────────────────
+def cmd_csv_upload(args):
+    from pathlib import Path
+    from playwright.sync_api import sync_playwright, TimeoutError as PWTimeoutError
+
+    data_dir = Path("data")
+    csv_files = sorted(data_dir.glob("*.csv"), key=lambda p: p.stat().st_mtime, reverse=True)
+    if not csv_files:
+        console.print("[red]No CSV files found in data/ folder.[/]")
+        return 1
+    csv_path = csv_files[0]
+    console.print(f"[cyan]Latest CSV:[/] {csv_path.name}")
+
+    # Prefer existing session; only fall back to credentials from config.json/env/keyring
+    storage = load_storage_state()
+    user = pwd = None
+    if storage is None:
+        try:
+            user, pwd = read_credentials()
+        except Exception:
+            user = pwd = None
+
+    # Only prompt if we truly have nothing
+    if (not storage) and (not user or not pwd):
+        # Final fallback: interactive prompt
+        import getpass
+        user = input("Shutterstock email/username: ").strip()
+        pwd = getpass.getpass("Shutterstock password: ")
+
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=not args.headful)
+        context_kwargs = {"viewport": {"width": 1400, "height": 900}}
+        if storage:
+            context_kwargs["storage_state"] = storage
+        context = browser.new_context(**context_kwargs)
+        page = context.new_page()
+
+        # If we have a session, try going straight to portfolio;
+        # if bounced to login, and we have creds, call login_shutterstock.
+        try:
+            page.goto("https://submit.shutterstock.com/portfolio/not_submitted/photo", wait_until="domcontentloaded")
+        except Exception:
+            pass
+
+        needs_login = False
+        try:
+            url_now = page.url
+            needs_login = ("accounts.shutterstock.com" in url_now) or ("login" in url_now)
+        except Exception:
+            needs_login = True
+
+        if needs_login and user and pwd:
+            login_shutterstock(page, user, pwd)
+            # persist updated storage
+            try:
+                save_storage_state(context)
+            except Exception:
+                pass
+
+        # Ensure we are on the portfolio page
+        try:
+            page.goto("https://submit.shutterstock.com/portfolio/not_submitted/photo", wait_until="domcontentloaded")
+        except Exception:
+            pass
+
+        ok = upload_metadata_csv(page, csv_path, timeout_s=args.timeout)
+
+        context.close()
+        browser.close()
+
+    if ok:
+        console.print("[bold green]CSV upload confirmed successful.[/]")
+        return 0
+    else:
+        console.print("[red]CSV upload did not confirm success.[/]")
+        return 1
+    csv_path = csv_files[0]
+    console.print(f"[cyan]Latest CSV:[/] {csv_path.name}")
+
+    email = os.getenv("SS_USER") or os.getenv("SHUTTERSTOCK_EMAIL") or input("Shutterstock email: ").strip()
+    password = os.getenv("SS_PASS") or os.getenv("SHUTTERSTOCK_PASSWORD") or getpass.getpass("Shutterstock password: ")
+
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=not args.headful)
+        context = browser.new_context(viewport={"width": 1400, "height": 900})
+        page = context.new_page()
+        # Reuse login function
+        login_shutterstock(page, email, password)
+        # Navigate to portfolio
+        page.goto("https://submit.shutterstock.com/portfolio/not_submitted/photo", wait_until="domcontentloaded")
+        ok = upload_metadata_csv(page, csv_path, timeout_s=args.timeout)
+        context.close()
+        browser.close()
+
+    if ok:
+        console.print("[bold green]CSV upload confirmed successful.[/]")
+        return 0
+    else:
+        console.print("[red]CSV upload did not confirm success.[/]")
+        return 1
+# ────────────────────────────────────────────────────────────────────────────────
+# Main CLI# ────────────────────────────────────────────────────────────────────────────────
 # Main CLI
 # ────────────────────────────────────────────────────────────────────────────────
 def build_parser() -> argparse.ArgumentParser:
@@ -1250,6 +1410,10 @@ def build_parser() -> argparse.ArgumentParser:
     sp_upload.add_argument("--debug", action="store_true", help="Dump last network JSON for troubleshooting")
     sp_upload.set_defaults(func=cmd_upload)
 
+    sp_csv_upload = sub.add_parser("ss:csv-upload", help="Upload the latest CSV from the data folder")
+    sp_csv_upload.add_argument("--timeout", type=int, default=180, help="Seconds to wait for success confirmation (default: 180)")
+    sp_csv_upload.add_argument("--headful", action="store_true", help="Show browser window instead of headless")
+    sp_csv_upload.set_defaults(func=cmd_csv_upload)
     return p
 
 
