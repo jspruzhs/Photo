@@ -6,11 +6,12 @@ Commands:
   - ss:login     → interactive login that persists session cookies/state
   - ss:quota     → show uploads used in the last 7 days (rolling, cap=500)
   - ss:status    → list recent submissions (read-only snapshot)
-  - ss:upload    → uploader skeleton:
+  - ss:upload    → uploader flow:
                    * builds queue from Excel (or --files)
                    * enforces 500 / 7d quota (conservative)
                    * opens Upload popup, attaches files
                    * watches ingestion and writes to ledger + Excel
+                   * generates CSV metadata and uploads it via the 'Upload CSV' modal
 
 Credentials priority:
 1) env: SS_USER / SS_PASS
@@ -28,6 +29,7 @@ Notes:
 from __future__ import annotations
 
 import argparse
+import csv
 import json
 import os
 from pathlib import Path
@@ -160,6 +162,33 @@ def ledger_append(event: Dict[str, Any]) -> None:
         f.write(json.dumps(event, ensure_ascii=False) + "\n")
 
 
+def ledger_entries_within(days: int = ROLLING_DAYS) -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
+    if not LEDGER_PATH.exists():
+        return out
+    cutoff = now_madrid() - timedelta(days=days)
+    with LEDGER_PATH.open("r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                obj = json.loads(line)
+                ts_raw = obj.get("timestamp", "")
+                if not ts_raw:
+                    continue
+                ts = parse_iso(str(ts_raw))
+                if ts >= cutoff:
+                    out.append(obj)
+            except Exception:
+                continue
+    return out
+
+
+def tally_ledger(days: int = ROLLING_DAYS) -> int:
+    return len(ledger_entries_within(days))
+
+
 def excel_update_status(
     path: Path,
     status: str,
@@ -230,37 +259,6 @@ def excel_update_status(
         ws.cell(row=target_row, column=c_in_at, value=ingested_at.isoformat())
 
     wb.save(str(xlsx_path))
-
-
-# ────────────────────────────────────────────────────────────────────────────────
-# Quota ledger tally (rolling 7-day window)
-# ────────────────────────────────────────────────────────────────────────────────
-def ledger_entries_within(days: int = ROLLING_DAYS) -> List[Dict[str, Any]]:
-    out: List[Dict[str, Any]] = []
-    if not LEDGER_PATH.exists():
-        return out
-    cutoff = now_madrid() - timedelta(days=days)
-    with LEDGER_PATH.open("r", encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                obj = json.loads(line)
-                ts_raw = obj.get("timestamp", "")
-                if not ts_raw:
-                    continue
-                ts = parse_iso(str(ts_raw))
-                if ts >= cutoff:
-                    out.append(obj)
-            except Exception:
-                continue
-    return out
-
-
-def tally_ledger(days: int = ROLLING_DAYS) -> int:
-    return len(ledger_entries_within(days))
-
 
 
 # ────────────────────────────────────────────────────────────────────────────────
@@ -521,6 +519,262 @@ def build_ss_queue(limit: Optional[int] = None) -> List[QueueItem]:
 
 
 # ────────────────────────────────────────────────────────────────────────────────
+# CSV export for Shutterstock bulk metadata
+# ────────────────────────────────────────────────────────────────────────────────
+ALLOWED_IMAGE_CATEGORIES = {
+    "Abstract","Animals/Wildlife","Arts","Backgrounds/Textures","Beauty/Fashion","Buildings/Landmarks",
+    "Business/Finance","Celebrities","Education","Food and drink","Healthcare/Medical","Holidays",
+    "Industrial","Interiors","Miscellaneous","Nature","Objects","Parks/Outdoor","People","Religion",
+    "Science","Signs/Symbols","Technology","Transportation","Vintage"
+}
+
+def _coerce_keywords(val) -> list[str]:
+    if not val:
+        return []
+    if isinstance(val, list):
+        toks = [str(x).strip() for x in val if str(x).strip()]
+    else:
+        toks = [t.strip() for t in str(val).split(",") if t.strip()]
+    return toks[:50]
+
+def _coerce_categories(row: dict) -> str:
+    cand = []
+    for key in ["SS_category1","SS_category2","category1","category2","SS_categories","categories"]:
+        v = row.get(key) if key in row else None
+        if not v:
+            continue
+        if isinstance(v, list):
+            cand += [str(x).strip() for x in v if str(x).strip()]
+        else:
+            cand += [t.strip() for t in str(v).split(",") if t.strip()]
+    uniq = []
+    for c in cand:
+        if c not in uniq:
+            uniq.append(c)
+    return ", ".join(uniq[:2])
+
+def export_shutterstock_csv(plan_items: list, xlsx_rows: list[dict], out_dir: Path = DATA_DIR) -> Path:
+    """
+    Build a CSV for Shutterstock metadata:
+      Columns: Filename, Description, Keywords, Categories
+    Filename MUST match uploaded basename (case-sensitive as shown in UI).
+    Description is capped at 200 characters.
+    """
+    out_dir.mkdir(exist_ok=True)
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    csv_path = out_dir / f"shutterstock_metadata_{ts}.csv"
+
+    idx_by_abs = {}
+    idx_by_name = {}
+    for r in xlsx_rows:
+        p_val = None
+        for k in ["file","filepath","path","relative_path","rel_path","abs_path"]:
+            if k in r and r[k]:
+                p_val = r[k]
+                break
+        if not p_val:
+            continue
+        try:
+            p = Path(str(p_val))
+            if not p.is_absolute():
+                p = (Path.cwd() / p).resolve()
+            idx_by_abs[str(p.resolve())] = r
+            idx_by_name[p.name] = r
+        except Exception:
+            continue
+
+    rows = []
+    for it in plan_items:
+        r = idx_by_abs.get(str(it.path.resolve())) or idx_by_name.get(it.path.name) or {}
+        desc = r.get("SS_description") or r.get("description") or r.get("SS_title") or r.get("title") or ""
+        desc = str(desc).strip()[:200]
+        kw = _coerce_keywords(r.get("SS_tags") or r.get("keywords") or it.keywords)
+        cats = _coerce_categories(r)
+
+        rows.append({
+            "Filename": it.path.name,
+            "Description": desc,
+            "Keywords": ", ".join(kw),
+            "Categories": cats,
+        })
+
+    with csv_path.open("w", encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=["Filename","Description","Keywords","Categories"])
+        writer.writeheader()
+        for row in rows:
+            writer.writerow(row)
+
+    return csv_path
+
+
+# ────────────────────────────────────────────────────────────────────────────────
+# Playwright helpers: ingestion watch + CSV modal
+# ────────────────────────────────────────────────────────────────────────────────
+def watch_ingestion(page, files: List[Path], network_bucket: Dict[str, Any], timeout_s: int = 180, debug: bool = False) -> Dict[str, Dict[str, Any]]:
+    """
+    Waits for each file to reach an 'ingested/processed' state.
+    Heuristics:
+      1) Global success button: "Go to portfolio" → mark all as INGESTED
+      2) Per-file: filename present AND any of {100%, complete, done, processed, uploaded}
+      3) Network JSON: try to capture asset_id by matching filename/title
+    """
+    deadline = time.time() + timeout_s
+    results: Dict[str, Dict[str, Any]] = {str(f): {"status": "UPLOADED", "uploaded_at": now_madrid().isoformat()} for f in files}
+
+    success_tokens = {"100%", "complete", "completed", "done", "processed", "ingested", "uploaded", "successful", "success"}
+
+    def mark_all_ingested():
+        ts = now_madrid().isoformat()
+        for k in results:
+            results[k]["status"] = "INGESTED"
+            results[k]["ingested_at"] = ts
+
+    def filename_visible(name: str) -> bool:
+        try:
+            return page.locator(f"text={name}").first.is_visible(timeout=500)
+        except Exception:
+            return False
+
+    def global_success() -> bool:
+        try:
+            if page.locator("button:has-text('Go to portfolio')").first.is_visible(timeout=500):
+                return True
+        except Exception:
+            pass
+        return False
+
+    while time.time() < deadline:
+        try:
+            if global_success():
+                mark_all_ingested()
+                break
+
+            rows = page.locator("div,li,article,tr").all()[:800]
+            for p in files:
+                key = str(p)
+                if results[key].get("status") == "INGESTED":
+                    continue
+                name = p.name
+
+                name_seen = filename_visible(name)
+                if name_seen:
+                    for row in rows:
+                        try:
+                            txt = row.inner_text(timeout=0) or ""
+                        except Exception:
+                            continue
+                        low = txt.lower()
+                        if name in txt and any(tok in low for tok in success_tokens):
+                            results[key]["status"] = "INGESTED"
+                            results[key]["ingested_at"] = now_madrid().isoformat()
+                            break
+
+            for key in list(results.keys()):
+                if "asset_id" in results[key]:
+                    continue
+                name = Path(key).name
+                for item in network_bucket.get("json", []):
+                    try:
+                        data = item.get("data")
+                        candidates = [data] if isinstance(data, dict) else (data if isinstance(data, list) else [])
+                        for obj in candidates:
+                            if not isinstance(obj, dict):
+                                continue
+                            aid = obj.get("id") or obj.get("asset_id") or obj.get("media_id")
+                            title = (obj.get("title") or obj.get("name") or "")
+                            filename = (obj.get("filename") or obj.get("file_name") or "")
+                            if aid and (name in str(filename) or name in str(title)):
+                                results[key]["asset_id"] = str(aid)
+                                break
+                    except Exception:
+                        continue
+
+            if all(results[str(p)].get("status") == "INGESTED" for p in files):
+                break
+
+            time.sleep(0.8)
+        except Exception:
+            time.sleep(0.8)
+
+    if debug:
+        try:
+            dbg_path = DATA_DIR / "ss_last_network.json"
+            with dbg_path.open("w", encoding="utf-8") as f:
+                json.dump(network_bucket, f, ensure_ascii=False, indent=2)
+            console.print(f"[dim]Saved network debug to {dbg_path}")
+        except Exception:
+            pass
+
+    return results
+
+
+def upload_metadata_csv(page, csv_path: Path, timeout_s: int = 90) -> bool:
+    """
+    Opens the 'Upload Metadata from CSV' modal and uploads the given CSV.
+    Returns True if we see success-ish cues (toast, message), False otherwise.
+    """
+    try:
+        if page.locator("[data-testid='csv-upload']").first.count():
+            page.locator("[data-testid='csv-upload']").first.click(timeout=4000)
+        else:
+            page.locator("button:has-text('Upload CSV')").first.click(timeout=4000)
+    except Exception:
+        try:
+            page.locator("button[aria-label*=more], [data-testid*=more]").first.click(timeout=2000)
+            page.locator("text=Upload CSV").first.click(timeout=2000)
+        except Exception:
+            return False
+
+    page.wait_for_timeout(600)
+
+    file_inputs = [
+        "input[type=file]",
+        "input[type='file']",
+        "form [type=file]",
+        "[data-testid='file-input'] input[type=file]"
+    ]
+    input_sel = None
+    for sel in file_inputs:
+        try:
+            el = page.locator(sel).first
+            if el and el.count():
+                input_sel = sel
+                break
+        except Exception:
+            continue
+    if not input_sel:
+        return False
+
+    try:
+        page.set_input_files(input_sel, str(csv_path))
+    except Exception:
+        try:
+            page.locator(input_sel).scroll_into_view_if_needed(timeout=1000)
+            page.set_input_files(input_sel, str(csv_path))
+        except Exception:
+            return False
+
+    end = time.time() + timeout_s
+    ok_tokens = {"processing", "processed", "success", "uploaded", "applied", "complete"}
+    while time.time() < end:
+        try:
+            toast = page.locator("div[role=alert], [data-testid=toast], [class*=toast]").first
+            if toast.count():
+                txt = (toast.inner_text(timeout=0) or "").lower()
+                if any(t in txt for t in ok_tokens):
+                    return True
+        except Exception:
+            pass
+        try:
+            if page.locator("text=Your CSV has been uploaded").first.is_visible(timeout=500):
+                return True
+        except Exception:
+            pass
+        time.sleep(0.7)
+    return False
+
+
+# ────────────────────────────────────────────────────────────────────────────────
 # Commands
 # ────────────────────────────────────────────────────────────────────────────────
 def cmd_login(args: argparse.Namespace) -> int:
@@ -619,11 +873,11 @@ def cmd_quota(args: argparse.Namespace) -> int:
             console.print(st)
 
     if remaining <= 0:
-        console.print("[red]Quota appears exhausted. Delay new uploads to avoid rejection.")
+        console.print("[red]Quota appears exhausted. Delay new uploads to avoid rejection.]")
     elif remaining < 25:
-        console.print("[yellow]Quota nearly exhausted—consider pausing bulk jobs.")
+        console.print("[yellow]Quota nearly exhausted—consider pausing bulk jobs.]")
     else:
-        console.print("[green]Quota headroom looks OK.")
+        console.print("[green]Quota headroom looks OK.]")
     return 0
 
 
@@ -658,7 +912,7 @@ def cmd_status(args: argparse.Namespace) -> int:
 
 
 # ────────────────────────────────────────────────────────────────────────────────
-# Upload: dashboard → Upload popup → attach files → watch ingestion → persist
+# Upload: dashboard → Upload popup → attach files → watch ingestion → CSV upload
 # ────────────────────────────────────────────────────────────────────────────────
 def cmd_upload(args: argparse.Namespace) -> int:
     # 1) Build queue from Excel (or fallback to --files)
@@ -704,13 +958,13 @@ def cmd_upload(args: argparse.Namespace) -> int:
     console.print(f"This run will attempt: {len(plan)} file(s)")
 
     if args.dry_run:
-        console.print("[green]Dry-run: no browser automation performed.")
+        console.print("[green]Dry-run: no browser automation performed.]")
         return 0
 
     # 3) Open dashboard → click Upload → wait modal → set input files
     storage = load_storage_state()
     if storage is None:
-        console.print("[red]No session found. Run ss:login first.")
+        console.print("[red]No session found. Run ss:login first.]")
         return 2
 
     candidate_urls = [
@@ -770,7 +1024,6 @@ def cmd_upload(args: argparse.Namespace) -> int:
 
         page.on("response", on_response)
 
-        # Resilient navigation that tolerates OAuth redirects and ERR_ABORTED
         def goto_resilient(url: str, timeout: int = 45000) -> str:
             try:
                 page.goto(url, wait_until="domcontentloaded", timeout=timeout)
@@ -782,7 +1035,6 @@ def cmd_upload(args: argparse.Namespace) -> int:
                 pass
             return page.url
 
-        # Auto-login if bounced to OAuth
         def ensure_logged_in() -> bool:
             try:
                 current = page.url
@@ -794,10 +1046,10 @@ def cmd_upload(args: argparse.Namespace) -> int:
 
             user, pwd = read_credentials()
             if not (user and pwd):
-                console.print("[red]We hit login but no credentials available. Run ss:login or set SS_USER/SS_PASS.")
+                console.print("[red]We hit login but no credentials available. Run ss:login or set SS_USER/SS_PASS.]")
                 return False
 
-            console.print("[yellow]Session needs re-auth. Attempting automatic login…")
+            console.print("[yellow]Session needs re-auth. Attempting automatic login…]")
             try:
                 page.wait_for_selector("input[type=email], input[name=email], input[name=username]", timeout=20000)
                 if page.query_selector("input[type=email]"):
@@ -817,7 +1069,7 @@ def cmd_upload(args: argparse.Namespace) -> int:
                 else:
                     page.click("button[data-testid='login-submit']")
             except Exception:
-                console.print("[red]Could not find login form elements automatically.")
+                console.print("[red]Could not find login form elements automatically.]")
                 return False
 
             try:
@@ -825,7 +1077,7 @@ def cmd_upload(args: argparse.Namespace) -> int:
             except Exception:
                 final = goto_resilient("https://submit.shutterstock.com/dashboard", timeout=60000)
                 if "submit.shutterstock.com" not in final:
-                    console.print("[red]Auto-login didn’t complete (MFA may be required). Try `ss:login` and rerun.")
+                    console.print("[red]Auto-login didn’t complete (MFA may be required). Try `ss:login` and rerun.]")
                     return False
             return True
 
@@ -851,7 +1103,6 @@ def cmd_upload(args: argparse.Namespace) -> int:
             return False
 
         try:
-            # Land on dashboard (resilient to redirects)
             for url in candidate_urls:
                 goto_resilient(url, timeout=45000)
                 page.wait_for_timeout(800)
@@ -859,27 +1110,22 @@ def cmd_upload(args: argparse.Namespace) -> int:
             if not ensure_logged_in():
                 return 2
 
-            # After login, ensure we're on dashboard
             goto_resilient("https://submit.shutterstock.com/dashboard", timeout=60000)
             page.wait_for_timeout(800)
 
-            # Click the header Upload button to open the modal
             opened = click_first(header_upload_btns)
             if not opened:
                 if not ensure_logged_in():
                     return 2
 
-            # Try the modal's own Upload button (varies per experiment)
             clicked_modal = click_first(modal_upload_btns)
             if not clicked_modal and not opened:
-                console.print("[yellow]Neither header nor modal upload controls were clickable yet; continuing scan…")
+                console.print("[yellow]Neither header nor modal upload controls were clickable yet; continuing scan…]")
 
-            # Wait for the file input to appear
             page.wait_for_timeout(1000)
 
             sel = find_file_input()
             if not sel:
-                # Try within iframes
                 for frame in page.frames:
                     try:
                         el = frame.query_selector("input[type=file]")
@@ -890,11 +1136,10 @@ def cmd_upload(args: argparse.Namespace) -> int:
                         pass
 
             if not sel:
-                console.print("[red]No file input found after opening upload UI.")
+                console.print("[red]No file input found after opening upload UI.]")
                 console.print(f"Current URL: {page.url}")
                 return 3
 
-            # Attach files (batch all planned files for now)
             file_paths = [str(it.path) for it in plan]
             try:
                 page.set_input_files(sel, file_paths)
@@ -903,39 +1148,60 @@ def cmd_upload(args: argparse.Namespace) -> int:
                     page.locator(sel).scroll_into_view_if_needed(timeout=2000)
                     page.set_input_files(sel, file_paths)
                 except Exception as e:
-                    console.print(f"[red]Failed to attach files: {e}")
+                    console.print(f"[red]Failed to attach files: {e}]")
                     return 4
 
-            console.print(f"[green]Attached {len(file_paths)} file(s) to uploader.")
+            console.print(f"[green]Attached {len(file_paths)} file(s) to uploader.]")
             console.print("Watching ingestion (up to 3 minutes)…")
 
-            # 4) Watch ingestion
             files_paths = [Path(fp) for fp in file_paths]
             results = watch_ingestion(page, files_paths, network_bucket, timeout_s=180, debug=args.debug)
 
-            # 5) Persist: ledger + Excel
+            # Persist: ledger + Excel
             for p in files_paths:
                 rec = results[str(p)]
                 uploaded_at = parse_iso(rec.get("uploaded_at")) if rec.get("uploaded_at") else now_madrid()
                 ingested_at = parse_iso(rec.get("ingested_at")) if rec.get("ingested_at") else None
                 asset_id = rec.get("asset_id")
-
-                # ledger events
                 file_sha = sha256_file(p)
                 ledger_append({"platform": "shutterstock", "event": "upload_started", "file": str(p), "sha256": file_sha})
                 if rec.get("status") == "INGESTED":
                     ledger_append({"platform": "shutterstock", "event": "ingested", "file": str(p), "sha256": file_sha, "asset_id": asset_id})
+                excel_update_status(p, status=rec.get("status") or "UPLOADED", asset_id=asset_id, uploaded_at=uploaded_at, ingested_at=ingested_at)
 
-                # Excel writeback
-                excel_update_status(
-                    p,
-                    status=rec.get("status") or "UPLOADED",
-                    asset_id=asset_id,
-                    uploaded_at=uploaded_at,
-                    ingested_at=ingested_at,
-                )
+            # Build and upload the CSV metadata for all files ingested in this run
+            ingested_paths = [p for p in files_paths if (results[str(p)].get("status") == "INGESTED")]
+            if ingested_paths:
+                plan_index = {str(it.path.resolve()): it for it in plan}
+                excel_rows = read_photos_excel()
+                mini_plan = []
+                for p in ingested_paths:
+                    it = plan_index.get(str(p.resolve()))
+                    if it:
+                        mini_plan.append(it)
+                csv_out = export_shutterstock_csv(mini_plan, excel_rows, DATA_DIR)
+                console.print(f"[blue]CSV prepared[/]: {csv_out.name}")
 
-            # 6) Human summary
+                # We need to navigate to the Not submitted page to see Upload CSV
+                goto_resilient("https://submit.shutterstock.com/portfolio/not_submitted/photo", timeout=45000)
+                page.wait_for_timeout(1000)
+
+                ok_csv = upload_metadata_csv(page, csv_out, timeout_s=120)
+                if ok_csv:
+                    console.print("[green]CSV uploaded to Shutterstock. Waiting briefly for metadata to apply…]")
+                    page.wait_for_timeout(1500)
+                    for p in ingested_paths:
+                        ledger_append({
+                            "platform": "shutterstock",
+                            "event": "csv_uploaded",
+                            "file": str(p),
+                            "sha256": sha256_file(p),
+                            "csv": str(csv_out.name),
+                        })
+                else:
+                    console.print("[yellow]CSV upload did not confirm success. Check the modal or try again.]")
+
+            # Human summary
             table = Table(title="Ingestion summary", box=box.SIMPLE_HEAVY)
             table.add_column("File")
             table.add_column("Status")
@@ -946,124 +1212,14 @@ def cmd_upload(args: argparse.Namespace) -> int:
             console.print(table)
 
             if any(results[str(p)].get("status") != "INGESTED" for p in files_paths):
-                console.print("[yellow]Some files did not reach an 'ingested' state within the timeout. They may complete shortly.")
+                console.print("[yellow]Some files did not reach an 'ingested' state within the timeout. They may complete shortly.]")
             else:
-                console.print("[green]All files show as ingested. Quota ledger and Excel were updated.")
+                console.print("[green]All files show as ingested. Quota ledger and Excel were updated.]")
         finally:
             context.storage_state(path=str(STORAGE_JSON))
             browser.close()
 
     return 0
-
-
-# ────────────────────────────────────────────────────────────────────────────────
-# Ingestion watcher
-# ────────────────────────────────────────────────────────────────────────────────
-def watch_ingestion(page, files: List[Path], network_bucket: Dict[str, Any], timeout_s: int = 180, debug: bool = False) -> Dict[str, Dict[str, Any]]:
-    """
-    Waits for each file to reach an 'ingested/processed' state.
-    Heuristics:
-      1) Global success button: "Go to portfolio" → mark all as INGESTED
-      2) Per-file: filename present AND any of {100%, complete, done, processed, uploaded}
-      3) Network JSON: try to capture asset_id by matching filename/title
-    """
-    deadline = time.time() + timeout_s
-    results: Dict[str, Dict[str, Any]] = {str(f): {"status": "UPLOADED", "uploaded_at": now_madrid().isoformat()} for f in files}
-
-    success_tokens = {"100%", "complete", "completed", "done", "processed", "ingested", "uploaded", "successful", "success"}
-
-    def mark_all_ingested():
-        ts = now_madrid().isoformat()
-        for k in results:
-            results[k]["status"] = "INGESTED"
-            results[k]["ingested_at"] = ts
-
-    # quick helper: filename-visible?
-    def filename_visible(name: str) -> bool:
-        try:
-            return page.locator(f"text={name}").first.is_visible(timeout=500)
-        except Exception:
-            return False
-
-    # quick helper: any global success cues?
-    def global_success() -> bool:
-        try:
-            if page.locator("button:has-text('Go to portfolio')").first.is_visible(timeout=500):
-                return True
-        except Exception:
-            pass
-        return False
-
-    while time.time() < deadline:
-        try:
-            # 1) Global success: "Go to portfolio"
-            if global_success():
-                mark_all_ingested()
-                break
-
-            # 2) Per-file DOM scan
-            # keep rows small for performance
-            rows = page.locator("div,li,article,tr").all()[:800]
-            for p in files:
-                key = str(p)
-                if results[key].get("status") == "INGESTED":
-                    continue
-                name = p.name
-
-                # If filename is visible anywhere, look for success tokens nearby (any row text)
-                name_seen = filename_visible(name)
-                if name_seen:
-                    for row in rows:
-                        try:
-                            txt = row.inner_text(timeout=0) or ""
-                        except Exception:
-                            continue
-                        low = txt.lower()
-                        if name in txt and any(tok in low for tok in success_tokens):
-                            results[key]["status"] = "INGESTED"
-                            results[key]["ingested_at"] = now_madrid().isoformat()
-                            break
-
-            # 3) Network JSON: asset_id extraction
-            for key in list(results.keys()):
-                if "asset_id" in results[key]:
-                    continue
-                name = Path(key).name
-                for item in network_bucket.get("json", []):
-                    try:
-                        data = item.get("data")
-                        candidates = [data] if isinstance(data, dict) else (data if isinstance(data, list) else [])
-                        for obj in candidates:
-                            if not isinstance(obj, dict):
-                                continue
-                            aid = obj.get("id") or obj.get("asset_id") or obj.get("media_id")
-                            title = (obj.get("title") or obj.get("name") or "")
-                            filename = (obj.get("filename") or obj.get("file_name") or "")
-                            if aid and (name in str(filename) or name in str(title)):
-                                results[key]["asset_id"] = str(aid)
-                                break
-                    except Exception:
-                        continue
-
-            # Exit early when done
-            if all(results[str(p)].get("status") == "INGESTED" for p in files):
-                break
-
-            time.sleep(0.8)
-        except Exception:
-            time.sleep(0.8)
-
-    # Optional: debug dump
-    if debug:
-        try:
-            dbg_path = DATA_DIR / "ss_last_network.json"
-            with dbg_path.open("w", encoding="utf-8") as f:
-                json.dump(network_bucket, f, ensure_ascii=False, indent=2)
-            console.print(f"[dim]Saved network debug to {dbg_path}")
-        except Exception:
-            pass
-
-    return results
 
 
 # ────────────────────────────────────────────────────────────────────────────────
@@ -1086,7 +1242,7 @@ def build_parser() -> argparse.ArgumentParser:
     sp_status.add_argument("--verbose", action="store_true", help="Show reasons/URLs when available")
     sp_status.set_defaults(func=cmd_status)
 
-    sp_upload = sub.add_parser("ss:upload", help="Upload: plan + popup + attach + watch ingestion + persist")
+    sp_upload = sub.add_parser("ss:upload", help="Upload: plan + popup + attach + watch ingestion + CSV upload")
     sp_upload.add_argument("--limit", type=int, default=None, help="Max files from Excel to consider")
     sp_upload.add_argument("--dry-run", action="store_true", help="Print plan only, no browser work")
     sp_upload.add_argument("--headful", action="store_true", help="Show browser window instead of headless")

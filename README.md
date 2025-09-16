@@ -212,4 +212,30 @@ Model/property release tracking
 
 CLI “upload markers” to flip status to SUBMITTED with a timestamp automatically
 
+#Full run from scratch
 
+# 1) Install & prepare (as before)
+make install
+
+# 2) Reset the Photos sheet to headers only (keeps schema intact)
+python scripts/update_photos.py --reset
+# (Your reset behavior lives in update_photos.py. :contentReference[oaicite:2]{index=2})
+
+# 3) Scan inbox/, generate previews, sync Excel rows
+python scripts/update_photos.py
+
+# 4) Generate base_* (title/description/tags) from previews
+python scripts/update_photos.py --describe --describe-limit 100
+# (This step is in update_photos.py — base_* generation. )
+
+# 5) Adapt to Shutterstock — now fills SS_title/SS_description/SS_tags + SS_category1/SS_category2
+python scripts/adapt_shutterstock.py --limit 100
+# (Adapter logic extended to include categories; it also ensures needed SS columns. :contentReference[oaicite:4]{index=4})
+
+python scripts/ss_cli.py ss:login
+
+python scripts/ss_cli.py ss:upload --limit 10 --headful
+
+or
+
+python scripts/ss_cli.py ss:upload --limit 10

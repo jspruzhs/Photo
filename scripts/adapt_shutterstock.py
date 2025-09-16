@@ -33,8 +33,20 @@ PER_ITEM_SLEEP = 0.2  # gentle pacing
 # Columns we need on Photos sheet
 REQUIRED_COLS = [
     "base_title","base_description","base_tags",
-    "SS_enabled","SS_status","SS_title","SS_description","SS_tags",
+    "SS_enabled","SS_status","SS_title","SS_description","SS_tags","SS_category1","SS_category2",
 ]
+
+# Shutterstock official categories (as of 2024-06)
+# Source: https://submit.shutterstock.com/en_US/submit/images/metadata
+# Note: category2 is optional and can be any subcategory; we do not enforce it
+ALLOWED_IMAGE_CATEGORIES = [
+    "Abstract","Animals/Wildlife","Arts","Backgrounds/Textures","Beauty/Fashion",
+    "Buildings/Landmarks","Business/Finance","Celebrities","Education","Food and drink",
+    "Healthcare/Medical","Holidays","Industrial","Interiors","Miscellaneous","Nature",
+    "Objects","Parks/Outdoor","People","Religion","Science","Signs/Symbols",
+    "Sports/Recreation","Technology","Transportation","Vintage"
+]
+
 
 # ---------- Logging ----------
 def setup_logging() -> logging.Logger:
@@ -196,10 +208,15 @@ def adapt_for_shutterstock(api_key: str, base_title: str, base_desc: str, base_t
     system = (
         "You are preparing metadata for Shutterstock. "
         f"Return strict JSON with keys: title (<= {TITLE_MAX_CHARS} chars), "
-        f"description (<= {desc_max} chars), tags (array up to {max_tags}). "
-        "Rules: factual, concise, no brand names or private info for RF items, "
-        "no keyword stuffing, tags are singular nouns/short phrases ordered by relevance."
+        f"description (<= {desc_max} chars), "
+        f"tags (array up to {max_tags}), "
+        "category1 (string, required), category2 (string, optional). "
+        "category1 and category2 must be chosen EXACTLY from this list: "
+        + ", ".join(ALLOWED_IMAGE_CATEGORIES) + ". "
+        "If unsure, use 'Miscellaneous' for category1 and leave category2 empty."
     )
+
+
     user = (
         "Adapt the following base metadata for Shutterstock.\n\n"
         f"Base title: {base_title}\n"
@@ -223,12 +240,21 @@ def adapt_for_shutterstock(api_key: str, base_title: str, base_desc: str, base_t
     title = (data.get("title") or "").strip()
     desc  = (data.get("description") or "").strip()
     tags  = [t.strip() for t in (data.get("tags") or []) if isinstance(t, str) and t.strip()]
+    cat1 = (data.get("category1") or "").strip()
+    cat2 = (data.get("category2") or "").strip()
+
     # normalize
     if len(title) > TITLE_MAX_CHARS:
         title = title[:TITLE_MAX_CHARS].rstrip(" ,.;:-")
     # de-dup and cap
     tags = list(dict.fromkeys(tags))[:max_tags]
-    return {"title": title, "description": desc, "tags": tags}
+    return {
+        "title": title,
+        "description": desc,
+        "tags": tags,
+        "category1": cat1,
+        "category2": cat2
+    }
 
 # ---------- Main work ----------
 def run(limit: Optional[int], force: bool, dry_run: bool):
@@ -270,6 +296,9 @@ def run(limit: Optional[int], force: bool, dry_run: bool):
         ss_title = (ws.cell(row=r, column=col["SS_title"]).value or "").strip()
         ss_desc  = (ws.cell(row=r, column=col["SS_description"]).value or "").strip()
         ss_tags  = (ws.cell(row=r, column=col["SS_tags"]).value or "").strip()
+        ss_c1 = (ws.cell(row=r, column=col["SS_category1"]).value or "").strip()
+        ss_c2 = (ws.cell(row=r, column=col["SS_category2"]).value or "").strip()
+
 
         already_filled = bool(ss_title and ss_desc and ss_tags)
         if already_filled and not force:
@@ -286,6 +315,9 @@ def run(limit: Optional[int], force: bool, dry_run: bool):
         title = result["title"]
         desc  = result["description"]
         tags  = result["tags"]
+        cat1 = result.get("category1","")
+        cat2 = result.get("category2","")
+
 
         ok, reason = small_qa(title, desc, tags, max_tags, desc_max)
         if not ok:
@@ -300,6 +332,8 @@ def run(limit: Optional[int], force: bool, dry_run: bool):
             ws.cell(row=r, column=col["SS_description"], value=desc)
             ws.cell(row=r, column=col["SS_tags"],        value=", ".join(tags))
             ws.cell(row=r, column=col["SS_status"],      value="READY_TO_UPLOAD")
+            ws.cell(row=r, column=col["SS_category1"], value=cat1)
+            ws.cell(row=r, column=col["SS_category2"], value=cat2)
 
         ws.cell(row=r, column=col["last_seen"], value=datetime.utcnow().isoformat())
         updated += 1

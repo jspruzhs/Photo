@@ -494,7 +494,7 @@ if __name__ == "__main__":
         log.info("Starting reset…")
         wb, ws, headers, col = open_workbook()
         ws.delete_rows(2, ws.max_row)
-        wb.save(EXEXCEL_PATH)  # <-- typo guard; correct below
+        wb.save(EXCEL_PATH)  # <-- typo guard; correct below
         # Fix typo: ensure proper save target
         wb.save(EXCEL_PATH)
         log.info(f"Reset {EXCEL_PATH} (headers only kept)")
